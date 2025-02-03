@@ -1,0 +1,250 @@
+import asyncio
+import aiohttp
+import typing as t
+import hmac
+import hashlib
+import time
+import json
+import base64
+from datetime import datetime
+from dataclasses import dataclass, asdict
+from enum import Enum, auto
+
+class ExchangeType(Enum):
+    """Supported cryptocurrency exchanges."""
+    BINANCE = auto()
+    COINMARKETCAP = auto()
+    KUCOIN = auto()
+    KRAKEN = auto()
+
+class CryptoExtractionError(Exception):
+    """Custom exception for cryptocurrency price extraction failures."""
+    pass
+
+@dataclass
+class ExchangeCredentials:
+    """Secure storage for exchange API credentials."""
+    api_key: str
+    secret_key: str
+    
+    def generate_signature(self, params: dict) -> str:
+        """Generate secure HMAC signature for API requests."""
+        sorted_params = sorted(params.items(), key=lambda x: x[0])
+        payload_string = '&'.join(f"{k}={v}" for k, v in sorted_params)
+        return hmac.new(
+            self.secret_key.encode('utf-8'), 
+            payload_string.encode('utf-8'), 
+            hashlib.sha256
+        ).hexdigest()
+
+@dataclass
+class CryptoPriceData:
+    """Structured cryptocurrency price information."""
+    symbol: str
+    price: float
+    exchange: ExchangeType
+    timestamp: datetime
+    
+    def to_dict(self) -> dict:
+        """Convert price data to dictionary."""
+        return {
+            **asdict(self),
+            'timestamp': self.timestamp.isoformat()
+        }
+
+class CryptoPriceAggregator:
+    """Advanced cryptocurrency price extraction and aggregation system."""
+    
+    def __init__(self, credentials: t.Dict[ExchangeType, ExchangeCredentials]):
+        self._credentials = credentials
+        self._session: t.Optional[aiohttp.ClientSession] = None
+    
+    async def __aenter__(self):
+        """Asynchronous context manager setup."""
+        self._session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, *exc):
+        """Asynchronous context manager cleanup."""
+        if self._session:
+            await self._session.close()
+    
+    async def _fetch_binance_prices(self) -> t.List[CryptoPriceData]:
+        """Extract cryptocurrency prices from Binance."""
+        if not self._session:
+            raise CryptoExtractionError("HTTP session not initialized")
+        
+        credentials = self._credentials.get(ExchangeType.BINANCE)
+        if not credentials:
+            raise CryptoExtractionError("Binance credentials not provided")
+        
+        try:
+            params = {
+                'timestamp': int(time.time() * 1000)
+            }
+            signature = credentials.generate_signature(params)
+            
+            async with self._session.get(
+                'https://api.binance.com/api/v3/ticker/price',
+                params=params
+            ) as response:
+                if response.status != 200:
+                    raise CryptoExtractionError(f"Binance API error: {response.status}")
+                
+                prices = await response.json()
+                return [
+                    CryptoPriceData(
+                        symbol=price['symbol'],
+                        price=float(price['price']),
+                        exchange=ExchangeType.BINANCE,
+                        timestamp=datetime.now()
+                    ) for price in prices
+                ]
+        except Exception as e:
+            raise CryptoExtractionError(f"Binance price extraction failed: {e}")
+    
+    async def _fetch_coinmarketcap_prices(self) -> t.List[CryptoPriceData]:
+        """Extract cryptocurrency prices from CoinMarketCap."""
+        if not self._session:
+            raise CryptoExtractionError("HTTP session not initialized")
+        
+        credentials = self._credentials.get(ExchangeType.COINMARKETCAP)
+        if not credentials:
+            raise CryptoExtractionError("CoinMarketCap credentials not provided")
+        
+        try:
+            headers = {
+                'X-CMC_PRO_API_KEY': credentials.api_key,
+                'Accept': 'application/json'
+            }
+            
+            async with self._session.get(
+                'https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest',
+                headers=headers,
+                params={'limit': 100}
+            ) as response:
+                if response.status != 200:
+                    raise CryptoExtractionError(f"CoinMarketCap API error: {response.status}")
+                
+                data = await response.json()
+                return [
+                    CryptoPriceData(
+                        symbol=crypto['symbol'],
+                        price=float(crypto['quote']['USD']['price']),
+                        exchange=ExchangeType.COINMARKETCAP,
+                        timestamp=datetime.now()
+                    ) for crypto in data.get('data', [])
+                ]
+        except Exception as e:
+            raise CryptoExtractionError(f"CoinMarketCap price extraction failed: {e}")
+    
+    async def _fetch_kucoin_prices(self) -> t.List[CryptoPriceData]:
+        """Extract cryptocurrency prices from KuCoin."""
+        if not self._session:
+            raise CryptoExtractionError("HTTP session not initialized")
+        
+        credentials = self._credentials.get(ExchangeType.KUCOIN)
+        if not credentials:
+            raise CryptoExtractionError("KuCoin credentials not provided")
+        
+        try:
+            async with self._session.get(
+                'https://api.kucoin.com/api/v1/market/allTickers'
+            ) as response:
+                if response.status != 200:
+                    raise CryptoExtractionError(f"KuCoin API error: {response.status}")
+                
+                data = await response.json()
+                return [
+                    CryptoPriceData(
+                        symbol=ticker['symbol'],
+                        price=float(ticker['last']),
+                        exchange=ExchangeType.KUCOIN,
+                        timestamp=datetime.now()
+                    ) for ticker in data.get('data', {}).get('ticker', [])
+                ]
+        except Exception as e:
+            raise CryptoExtractionError(f"KuCoin price extraction failed: {e}")
+    
+    async def extract_prices(
+        self, 
+        symbols: t.Optional[t.List[str]] = None
+    ) -> t.List[CryptoPriceData]:
+        """
+        Aggregate cryptocurrency prices across multiple exchanges.
+        
+        Args:
+            symbols: Optional list of specific cryptocurrency symbols to extract
+        
+        Returns:
+            Comprehensive list of cryptocurrency prices
+        """
+        # Concurrent price extraction from exchanges
+        price_tasks = [
+            self._fetch_binance_prices(),
+            self._fetch_coinmarketcap_prices(),
+            self._fetch_kucoin_prices()
+        ]
+        
+        try:
+            # Execute price extraction concurrently
+            all_prices = await asyncio.gather(*price_tasks)
+            
+            # Flatten and filter prices
+            flattened_prices = [
+                price for exchange_prices in all_prices 
+                for price in exchange_prices
+            ]
+            
+            # Optional symbol filtering
+            if symbols:
+                flattened_prices = [
+                    price for price in flattened_prices 
+                    if price.symbol in symbols
+                ]
+            
+            return flattened_prices
+        
+        except Exception as e:
+            raise CryptoExtractionError(f"Price extraction failed: {e}")
+
+def main():
+    """Demonstration of cryptocurrency price aggregation."""
+    # Create exchange credentials
+    credentials = {
+        ExchangeType.BINANCE: ExchangeCredentials(
+            api_key='BINANCE_API_KEY',
+            secret_key='BINANCE_SECRET_KEY'
+        ),
+        ExchangeType.COINMARKETCAP: ExchangeCredentials(
+            api_key='CMC_API_KEY',
+            secret_key='CMC_SECRET_KEY'
+        ),
+        ExchangeType.KUCOIN: ExchangeCredentials(
+            api_key='KUCOIN_API_KEY',
+            secret_key='KUCOIN_SECRET_KEY'
+        )
+    }
+    
+    async def run_demo():
+        async with CryptoPriceAggregator(credentials) as aggregator:
+            try:
+                # Extract prices for specific symbols
+                target_symbols = ['BTC', 'ETH', 'BNB']
+                prices = await aggregator.extract_prices(symbols=target_symbols)
+                
+                # Display extracted prices
+                for price in prices:
+                    print(
+                        f"Symbol: {price.symbol}, "
+                        f"Price: ${price.price:.2f}, "
+                        f"Exchange: {price.exchange.name}"
+                    )
+            
+            except CryptoExtractionError as e:
+                print(f"Extraction Error: {e}")
+    
+    asyncio.run(run_demo())
+
+if __name__ == '__main__':
+    main()
